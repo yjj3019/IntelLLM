@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+npu-env/
+npu-env-python*/
+models/
+cache/
+logs/
+rag/documents/
+rag/qdrant_storage/
+*.pdf
+.env
+.env.*
+!.env.example
+server/*-backup.py
+

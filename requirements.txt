@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+openvino-genai
+qdrant-client
+sentence-transformers
+
