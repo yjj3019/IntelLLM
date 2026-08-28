@@ -26,7 +26,7 @@ import openvino_genai as ov_genai
 # Version
 # ============================================================
 
-VERSION = "0.11.12"
+VERSION = "0.11.13"
 
 
 # ============================================================
@@ -84,6 +84,9 @@ DEFAULT_MAX_TOKENS = 512
 RAG_DEFAULT_MAX_TOKENS = 320
 
 NPU_MAX_TOKENS = 256
+
+# Auto-routed short replies do not need the explicit NPU request ceiling.
+NPU_AUTO_MAX_TOKENS = 64
 
 GPU_MAX_TOKENS = 1024
 
@@ -240,6 +243,21 @@ def choose_model(
     # 긴 질문은 GPU
     if len(prompt) > 120:
         return "local-gpu-main"
+
+
+    # Short arithmetic is a safe, low-latency NPU workload.
+    if (
+        len(prompt) <= 48
+        and re.search(
+            r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?![A-Za-z0-9])",
+            text,
+        )
+        and not re.search(
+            r"\b\d{4}-\d{1,2}-\d{1,2}\b",
+            text,
+        )
+    ):
+        return "local-npu-fast"
 
 
     # 명확한 단순 작업만 NPU
@@ -2150,6 +2168,13 @@ async def chat_completions(
             ),
         )
 
+    if (
+        request.model == "local-auto"
+        and model == "local-npu-fast"
+        and max_tokens == DEFAULT_MAX_TOKENS
+    ):
+        max_tokens = NPU_AUTO_MAX_TOKENS
+
     # If the caller uses the API default, keep RAG answers to a smaller
     # output budget. Explicit custom values other than the default are honored.
     if (
@@ -2177,6 +2202,13 @@ async def chat_completions(
         get_ollama_model(model)
         if model != "local-npu-fast"
         else ""
+    )
+
+    applied_max_tokens = min(
+        max_tokens,
+        NPU_MAX_TOKENS
+        if model == "local-npu-fast"
+        else GPU_MAX_TOKENS,
     )
 
     # ========================================================
@@ -2602,7 +2634,7 @@ async def chat_completions(
                 ),
 
             "max_tokens_applied":
-                max_tokens,
+                applied_max_tokens,
 
             "ollama_done_reason":
                 (

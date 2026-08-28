@@ -5,6 +5,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
@@ -816,9 +817,10 @@ def _search_context(
     query_urls = []
     errors = []
 
-    for search_query, plan_quality in plans:
+    def run_plan(plan):
+        search_query, plan_quality = plan
         try:
-            results, query_url = _search_once(
+            return _search_once(
                 search_query,
                 prompt,
                 game=bool(game),
@@ -826,10 +828,26 @@ def _search_context(
                     bool(official_domains)
                     or plan_quality == "official"
                 ),
-            )
+            ), ""
         except Exception as exc:
-            errors.append(str(exc))
+            return None, str(exc)
+
+    if len(plans) > 1:
+        # ponytail: cap at two workers to match the current two-query plan.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            plan_results = list(pool.map(run_plan, plans))
+    else:
+        plan_results = [run_plan(plans[0])]
+
+    for (search_query, plan_quality), (plan_result, error) in zip(
+        plans,
+        plan_results,
+    ):
+        if error:
+            errors.append(error)
             continue
+
+        results, query_url = plan_result
         query_urls.append(query_url)
         result_limit = 20 if official_domains else 5
         for rank, item in enumerate(results[:result_limit]):
