@@ -207,6 +207,33 @@ GAME_PROFILES = {
             "steamcommunity.com",
         ),
     },
+    "minecraft_apotheosis": {
+        "label": "Minecraft / Apotheosis",
+        "query_name": "Apotheosis Minecraft",
+        "aliases": (
+            "apotheosis",
+            "아포테오시스",
+            "apothic spawners",
+            "apothic-spawners",
+        ),
+        "official": ("curseforge.com", "github.com"),
+        "official_paths": (
+            "/minecraft/mc-mods/apotheosis",
+            "/minecraft/mc-mods/apothic-spawners",
+            "/shadows-of-fire/apotheosis",
+            "/shadows-of-fire/apothic-spawners",
+        ),
+        "trusted": (
+            "wiki.siriusmc.net",
+            "minecraft-apotheosis-mod.fandom.com",
+            "minecraft-guides.com",
+            "allthemods.github.io",
+            "minecraft.wiki",
+            "namu.wiki",
+            "reddit.com",
+        ),
+        "search_language": "en-US",
+    },
 }
 
 GAME_OFFICIAL_PATTERNS = (
@@ -254,6 +281,14 @@ GAME_GUIDE_PATTERNS = (
     "배합",
     "교배",
     "패시브",
+    "만드는법",
+    "만드는 법",
+    "몬스터팜",
+    "몹팜",
+    "monster farm",
+    "mob farm",
+    "farm",
+    "farms",
     "guide",
     "tier",
     "build",
@@ -409,7 +444,8 @@ def _game_query_text(prompt: str, profile) -> str:
         r"패치\s*버전과\s*지역을\s*구분해줘|"
         r"패치\s*버전과\s*지역을\s*써줘|지역을\s*써줘|"
         r"글로벌\s*서버\s*기준으로\s*답해줘|기준으로\s*답해줘|"
-        r"구분해줘|구분해 주세요|5줄\s*이내(?:로)?|및",
+        r"구분해줘|구분해 주세요|5줄\s*이내(?:로)?|"
+        r"만드는\s*법|몬스터\s*팜|몹\s*팜|및",
         " ",
         query,
         flags=re.IGNORECASE,
@@ -435,6 +471,31 @@ def _build_game_search_queries(prompt: str, game: str):
         for pattern in GAME_GUIDE_PATTERNS
     )
     queries = []
+
+    if game == "minecraft_apotheosis":
+        if official_intent or not guide_intent:
+            queries.append(
+                (
+                    "Apotheosis Minecraft mod official"
+                    + official_site,
+                    "official",
+                )
+            )
+            queries.append(
+                (
+                    "Apothic Spawners Minecraft official"
+                    + official_site,
+                    "official",
+                )
+            )
+        if guide_intent or not official_intent:
+            queries.append(
+                (
+                    "Apotheosis Minecraft mod guide spawner",
+                    "trusted",
+                )
+            )
+        return queries
 
     if official_intent or not guide_intent:
         queries.append(
@@ -630,19 +691,20 @@ def _search_once(
     prompt: str,
     game: bool = False,
     official: bool = False,
+    language: str = "all",
 ):
     params = {
         "q": search_query,
         "format": "json",
-        "language": "all",
+        "language": language,
         "safesearch": 1,
         "categories": "general",
         "pageno": 1,
     }
-    if game and not official:
-        params["engines"] = "bing"
-    elif official:
-        params["engines"] = "google,bing"
+    if game or official:
+        # SearXNG engine shortcuts are stable here; full names can be parsed
+        # as an engine group and return unrelated results on this instance.
+        params["engines"] = "bi"
 
     if not game and any(
         pattern in prompt
@@ -675,6 +737,27 @@ def _domain_matches(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+def _profile_official_match(url: str, profile) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not any(
+        _domain_matches(host, domain)
+        for domain in profile.get("official", ())
+    ):
+        return False
+
+    paths = profile.get("official_paths", ())
+    if not paths:
+        return True
+
+    target = parsed.path.rstrip("/").lower()
+    return any(
+        target == path.lower()
+        or target.startswith(path.lower().rstrip("/") + "/")
+        for path in paths
+    )
+
+
 def _official_domains(prompt: str):
     value = prompt.lower()
     for keywords, domain_hint in OFFICIAL_DOMAIN_HINTS:
@@ -700,10 +783,7 @@ def _source_quality(url: str, profile=None) -> str:
     if not profile:
         return "general"
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    if any(
-        _domain_matches(host, domain)
-        for domain in profile["official"]
-    ):
+    if _profile_official_match(url, profile):
         if "hoyolab.com" in host and not (
             "/official/" in urllib.parse.urlparse(url).path
             or host.startswith("wiki.")
@@ -737,10 +817,13 @@ def _game_result_relevant(
     ):
         return False
 
-    official = any(
+    official_host = any(
         _domain_matches(host, domain)
-        for domain in profile["official"]
+        for domain in profile.get("official", ())
     )
+    official = _profile_official_match(url, profile)
+    if official_host and profile.get("official_paths") and not official:
+        return False
     shared_official = any(
         _domain_matches(host, domain)
         for domain in profile.get("shared_official", ())
@@ -828,6 +911,11 @@ def _search_context(
                     bool(official_domains)
                     or plan_quality == "official"
                 ),
+                language=(
+                    profile.get("search_language", "all")
+                    if game
+                    else "all"
+                ),
             ), ""
         except Exception as exc:
             return None, str(exc)
@@ -849,7 +937,7 @@ def _search_context(
 
         results, query_url = plan_result
         query_urls.append(query_url)
-        result_limit = 20 if official_domains else 5
+        result_limit = 20 if official_domains else 12 if game else 5
         for rank, item in enumerate(results[:result_limit]):
             title = _clean_text(item.get("title", ""))
             url = item.get("url", "")

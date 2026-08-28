@@ -4,14 +4,14 @@ Intel Core Ultra 7 258V용 로컬 AI 라우터입니다. 단순 질의는 OpenVI
 
 ## 현재 기준
 
-- Router: FastAPI `v0.11.13`
+- Router: FastAPI `v0.11.14`
 - NPU: Intel AI Boost / OpenVINO GenAI / `LFM2-1.2B`
 - GPU main: Intel Arc 140V / Ollama Vulkan / `qwen3:8b`
 - GPU deep: Ollama / `qwen3:14b` 수동 선택
 - RAG: Qdrant + `intfloat/multilingual-e5-base`
 - RAG 검색: candidate 12 → deterministic rerank → Top 2
 - Live search: 로컬 SearXNG 기반 공식 문서·게임·날씨 검색
-- v0.11.13: 짧은 산술 질의의 NPU 자동 라우팅, 자동 NPU 출력 상한 64토큰, 게임 공식 검색 쿼리 병렬 실행
+- v0.11.14: Apotheosis Minecraft 검색 라우팅·공식 경로 필터, 버전/로더 범위 guard, 게임 검색 반복 방지
 
 ## 저장 범위
 
@@ -54,7 +54,7 @@ OpenAI 호환 엔드포인트는 `POST /v1/chat/completions`입니다. 모델 �
 - Qwen3 8B GPU decode: 약 14~16 tok/s
 - RHEL RAG 전체 응답: 질문과 출력 길이에 따라 약 14~18초
 
-v0.11.13은 시작 직후 NPU/RAG 준비 작업과 Qdrant 연결 재사용을 유지하면서, 짧은 자동 질의를 NPU로 보내고 게임 검색 쿼리를 최대 2개 병렬 처리합니다. GPU 모델, RAG 후보 수, Top 2, 문서 발췌 정책은 유지합니다.
+v0.11.14는 v0.11.13의 NPU/RAG 준비 작업과 Qdrant 연결 재사용을 유지하면서, Apotheosis 질의를 실시간 게임 검색으로 보내고 CurseForge/GitHub의 해당 프로젝트 경로만 공식으로 인정합니다. GPU 모델, RAG 후보 수, Top 2, 문서 발췌 정책은 유지합니다.
 
 ## 주의
 
