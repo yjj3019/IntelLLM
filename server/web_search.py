@@ -120,6 +120,10 @@ GAME_PROFILES = {
             "leagueoflegends.com",
             "support-leagueoflegends.riotgames.com",
         ),
+        "excluded_official": (
+            "wildrift.leagueoflegends.com",
+            "teamfighttactics.leagueoflegends.com",
+        ),
         "trusted": (
             "wiki.leagueoflegends.com",
             "u.gg",
@@ -151,6 +155,7 @@ GAME_PROFILES = {
             "hoyolab.com",
             "wiki.hoyolab.com",
         ),
+        "shared_official": ("hoyolab.com",),
         "trusted": (
             "genshin-impact.fandom.com",
             "game8.co",
@@ -172,6 +177,7 @@ GAME_PROFILES = {
             "zenless.hoyoverse.com",
             "hoyolab.com",
         ),
+        "shared_official": ("hoyolab.com",),
         "trusted": (
             "zzz.wiki.gg",
             "zenless-zone-zero.fandom.com",
@@ -417,6 +423,7 @@ def _game_query_text(prompt: str, profile) -> str:
 def _build_game_search_queries(prompt: str, game: str):
     profile = GAME_PROFILES[game]
     base = _game_query_text(prompt, profile)
+    official_site = f" site:{profile['official'][0]}"
     value = prompt.lower()
     official_intent = any(
         pattern in value
@@ -432,7 +439,15 @@ def _build_game_search_queries(prompt: str, game: str):
         queries.append(
             (
                 f"{profile['query_name']} {base} "
-                f"공식 패치 공지 업데이트",
+                f"{profile['label']} 공식 패치 공지 업데이트"
+                f"{official_site}",
+                "official",
+            )
+        )
+        queries.append(
+            (
+                f"{profile['label']} latest official news"
+                f"{official_site}",
                 "official",
             )
         )
@@ -623,12 +638,12 @@ def _search_once(
         "categories": "general",
         "pageno": 1,
     }
-    if game:
+    if game and not official:
         params["engines"] = "bing"
     elif official:
         params["engines"] = "google,bing"
 
-    if any(
+    if not game and any(
         pattern in prompt
         for pattern in ("뉴스", "속보", "오늘", "최근", "최신")
     ):
@@ -708,6 +723,44 @@ def _source_quality(url: str, profile=None) -> str:
     return "general"
 
 
+def _game_result_relevant(
+    url: str,
+    title: str,
+    profile,
+) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+
+    if any(
+        _domain_matches(host, domain)
+        for domain in profile.get("excluded_official", ())
+    ):
+        return False
+
+    official = any(
+        _domain_matches(host, domain)
+        for domain in profile["official"]
+    )
+    shared_official = any(
+        _domain_matches(host, domain)
+        for domain in profile.get("shared_official", ())
+    )
+
+    if official and not shared_official:
+        return True
+
+    # Precision first: trusted sites can mention a game in a generic snippet;
+    # require the title or URL to identify the requested game.
+    title_url = re.sub(
+        r"[_-]+",
+        " ",
+        f"{title} {url}".lower(),
+    )
+    return any(
+        alias.lower() in title_url
+        for alias in profile["aliases"]
+    )
+
+
 def _canonical_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit(
@@ -725,6 +778,14 @@ def _search_context(
     prompt: str,
 ):
     game = detect_game_profile(prompt)
+    game_official_intent = any(
+        pattern in prompt.lower()
+        for pattern in GAME_OFFICIAL_PATTERNS
+    )
+    game_guide_intent = any(
+        pattern in prompt.lower()
+        for pattern in GAME_GUIDE_PATTERNS
+    )
     official_request = any(
         marker in prompt.lower()
         for marker in ("공식", "official", "출처")
@@ -761,7 +822,10 @@ def _search_context(
                 search_query,
                 prompt,
                 game=bool(game),
-                official=bool(official_domains),
+                official=(
+                    bool(official_domains)
+                    or plan_quality == "official"
+                ),
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -773,6 +837,11 @@ def _search_context(
             url = item.get("url", "")
             if not url:
                 continue
+            snippet = _clean_text(
+                item.get("content")
+                or item.get("snippet")
+                or ""
+            )
             key = _canonical_url(url)
             if key in seen:
                 continue
@@ -787,6 +856,12 @@ def _search_context(
                     for domain in official_domains
                 ):
                     continue
+            if game and not _game_result_relevant(
+                url=url,
+                title=title,
+                profile=profile,
+            ):
+                continue
             quality = _source_quality(url, profile)
             if official_domains:
                 quality = "official"
@@ -796,16 +871,30 @@ def _search_context(
                 {
                     "title": title,
                     "url": url,
-                    "snippet": _clean_text(
-                        item.get("content")
-                        or item.get("snippet")
-                        or ""
-                    ),
+                    "snippet": snippet,
                     "quality": quality,
                     "plan_quality": plan_quality,
                     "rank": rank,
                 }
             )
+
+    if game and game_official_intent:
+        official_results = [
+            item
+            for item in collected
+            if item["quality"] == "official"
+        ]
+        if official_results:
+            collected = official_results
+
+    if game and game_guide_intent:
+        guide_results = [
+            item
+            for item in collected
+            if item["quality"] in {"wiki", "community"}
+        ]
+        if guide_results:
+            collected = guide_results
 
     if not collected:
         detail = errors[-1] if errors else "검색 결과가 없습니다."
