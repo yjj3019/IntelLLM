@@ -60,6 +60,27 @@ TECH_ANCHORS = [
     "lsblk",
     "vmstat",
     "free",
+    "selinux",
+    "semanage",
+    "restorecon",
+    "chcon",
+    "sepolicy",
+    "getenforce",
+    "setenforce",
+    "audit2allow",
+    "avc denied",
+    "firewalld",
+    "firewall-cmd",
+    "iptables",
+    "nftables",
+    "networkmanager",
+    "nmcli",
+    "nmtui",
+    "bonding",
+    "systemd",
+    "systemctl",
+    "journalctl",
+    "unit file",
 ]
 
 
@@ -672,27 +693,57 @@ def build_rag_context(
     if product == "RHEL":
         scope_rule = (
             "Keep parameters separate and preserve before/after/until "
-            "direction exactly. For FC timeouts, say that fast_io_fail_tmo "
-            "causes I/O failure only after its timeout expires, not merely "
-            "when configured. Say that blocked-queue I/O may wait until "
-            "dev_loss_tmo only when that condition is supported; do not "
-            "generalize it to all I/O. When both parameters are asked, "
-            "preserve this sequence: FC remote-port failure detection, "
-            "fast_io_fail_tmo expiry and path I/O failure, then "
-            "dev_loss_tmo expiry and remote-port/device removal. Do not "
-            "say that configuring a timeout immediately fails I/O. If "
-            "fast_io_fail_tmo is numeric, running or new path I/O fails "
-            "when that timeout triggers; only I/O in a blocked queue waits "
-            "until dev_loss_tmo expires and the queue unblocks. If "
-            "fast_io_fail_tmo is off, no I/O fails until device removal. "
-            "Do not describe dev_loss_tmo as the general I/O-failure timer."
+            "direction exactly."
         )
-        final_rule = (
-            "Use only the excerpts, do not invent missing numbers or "
-            "example values, state timeout expiry before I/O failure, "
-            "do not say all I/O waits until dev_loss_tmo, and keep the "
-            "answer short enough to finish naturally."
+
+        # The FC/multipath timeout sequencing rule below only applies to
+        # that storage topic; gate it so every other RHEL answer (SELinux,
+        # firewalld, systemd, ...) doesn't pay its prompt-size cost.
+        fc_timeout_topic = any(
+            anchor in _query_anchors(query)
+            for anchor in (
+                "fast_io_fail_tmo",
+                "dev_loss_tmo",
+                "eh_deadline",
+                "no_path_retry",
+                "recovery_tmo",
+                "replacement_timeout",
+                "multipath",
+                "multipathd",
+                "fibre channel",
+                "fiber channel",
+            )
         )
+
+        if fc_timeout_topic:
+            scope_rule += (
+                " For FC timeouts, say that fast_io_fail_tmo "
+                "causes I/O failure only after its timeout expires, not merely "
+                "when configured. Say that blocked-queue I/O may wait until "
+                "dev_loss_tmo only when that condition is supported; do not "
+                "generalize it to all I/O. When both parameters are asked, "
+                "preserve this sequence: FC remote-port failure detection, "
+                "fast_io_fail_tmo expiry and path I/O failure, then "
+                "dev_loss_tmo expiry and remote-port/device removal. Do not "
+                "say that configuring a timeout immediately fails I/O. If "
+                "fast_io_fail_tmo is numeric, running or new path I/O fails "
+                "when that timeout triggers; only I/O in a blocked queue waits "
+                "until dev_loss_tmo expires and the queue unblocks. If "
+                "fast_io_fail_tmo is off, no I/O fails until device removal. "
+                "Do not describe dev_loss_tmo as the general I/O-failure timer."
+            )
+            final_rule = (
+                "Use only the excerpts, do not invent missing numbers or "
+                "example values, state timeout expiry before I/O failure, "
+                "do not say all I/O waits until dev_loss_tmo, and keep the "
+                "answer short enough to finish naturally."
+            )
+        else:
+            final_rule = (
+                "Use only the excerpts, do not invent missing numbers or "
+                "example values, and keep the answer short enough to "
+                "finish naturally."
+            )
     else:
         scope_rule = (
             "Preserve the product, model, version, region, and software "

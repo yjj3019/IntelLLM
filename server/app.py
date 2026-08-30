@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import functools
 import hmac
 import importlib.util
 import json
@@ -20,7 +21,7 @@ from web_search import (
 )
 from typing import List, Literal, Optional, Tuple, Union
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -87,41 +88,63 @@ def _presented_api_key(
     return authorization
 
 
+# Plain ASGI middleware, not BaseHTTPMiddleware: BaseHTTPMiddleware pipes
+# the request through its own internal receive()-consuming task, which is
+# incompatible with a downstream handler that also awaits request.receive()
+# directly (needed elsewhere to detect a client disconnect mid-generation
+# and free the shared GPU lock promptly) — that combination breaks with
+# "No response returned." for every request once BaseHTTPMiddleware's
+# consumption is bypassed. A plain ASGI middleware just forwards `receive`/
+# `send` straight through, so it doesn't have this conflict.
+#
 # Registered before CORS so the CORS middleware stays outermost
 # and preflight/error responses keep their CORS headers.
-@app.middleware("http")
-async def api_key_guard(
-    request: Request,
-    call_next,
-):
+class APIKeyGuardMiddleware:
 
-    if (
-        API_KEY
-        and request.method != "OPTIONS"
-        and request.url.path.startswith("/v1/")
-    ):
+    def __init__(self, app):
+        self.app = app
 
-        # Compare as bytes: compare_digest rejects non-ASCII str.
-        if not hmac.compare_digest(
-            _presented_api_key(request).encode("utf-8"),
-            API_KEY.encode("utf-8"),
+    async def __call__(self, scope, receive, send):
+
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+
+        if (
+            API_KEY
+            and request.method != "OPTIONS"
+            and request.url.path.startswith("/v1/")
         ):
 
-            # Never log or echo the presented credential.
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "message":
-                            "invalid or missing API key",
+            # Compare as bytes: compare_digest rejects non-ASCII str.
+            if not hmac.compare_digest(
+                _presented_api_key(request).encode("utf-8"),
+                API_KEY.encode("utf-8"),
+            ):
 
-                        "type":
-                            "invalid_request_error",
-                    }
-                },
-            )
+                # Never log or echo the presented credential.
+                response = JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message":
+                                "invalid or missing API key",
 
-    return await call_next(request)
+                            "type":
+                                "invalid_request_error",
+                        }
+                    },
+                )
+
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(APIKeyGuardMiddleware)
 
 
 app.add_middleware(
@@ -250,6 +273,17 @@ npu_lock = threading.Lock()
 
 ollama_lock = threading.Lock()
 
+# There is one physical GPU, so all local-gpu-main/deep/vision traffic is
+# intentionally single-flight through ollama_lock. A non-streaming request
+# waiting longer than this for the GPU fails fast with 503 instead of
+# blocking silently for up to the 600s upstream socket timeout.
+OLLAMA_LOCK_WAIT_SECONDS = 120
+
+
+class GPUBusyError(RuntimeError):
+    """Raised when a request could not acquire ollama_lock in time."""
+
+
 # How often a streaming response re-checks client disconnect while the
 # backend is silent. Without this the SSE loop parks on queue.get()
 # forever and the worker keeps the device lock for the full HTTP timeout.
@@ -336,7 +370,57 @@ SIMPLE_PATTERNS = [
     "어디야?",
     "몇 개",
     "몇개",
+
+    "capital of",
+    "translate this",
+    "translate to",
+    "how many",
+    "is that right",
+    "is that correct",
+    "classify this",
 ]
+
+
+# TECH_KEYWORDS mixes ASCII (space-delimited) and Korean (agglutinative,
+# particles attach with no space) entries. \b-based whole-word matching is
+# correct for the ASCII half — it's what stops "python" from matching
+# inside "pythonic" — but the same boundary check would miss ordinary
+# Korean usage like "쿠버네티스를" (keyword + attached particle, no
+# boundary between them), so Korean entries keep plain substring matching.
+def _is_ascii_word(word: str) -> bool:
+    return all(ord(ch) < 128 for ch in word)
+
+
+_TECH_KEYWORDS_ASCII = [
+    keyword
+    for keyword in TECH_KEYWORDS
+    if _is_ascii_word(keyword)
+]
+
+_TECH_KEYWORDS_OTHER = [
+    keyword
+    for keyword in TECH_KEYWORDS
+    if not _is_ascii_word(keyword)
+]
+
+_TECH_KEYWORD_ASCII_PATTERN = re.compile(
+    r"\b(" + "|".join(
+        re.escape(keyword)
+        for keyword in _TECH_KEYWORDS_ASCII
+    ) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_tech_keyword(text: str) -> bool:
+
+    if _TECH_KEYWORD_ASCII_PATTERN.search(text):
+        return True
+
+    return any(
+        keyword in text
+        for keyword in _TECH_KEYWORDS_OTHER
+    )
 
 
 def is_live_info_query(
@@ -359,10 +443,7 @@ def choose_model(
 
 
     # 기술 질문은 GPU
-    if any(
-        keyword in text
-        for keyword in TECH_KEYWORDS
-    ):
+    if _has_tech_keyword(text):
         return "local-gpu-main"
 
 
@@ -489,6 +570,60 @@ def get_message_text(
     return "\n".join(text_parts).strip()
 
 
+# Longest edge forwarded to the vision model. Ollama/gemma3 gain nothing
+# from more pixels than this for typical VQA use, so downscaling first
+# cuts payload size, decode cost, and prompt tokens.
+MAX_IMAGE_EDGE_PX = 1024
+
+
+@functools.lru_cache(maxsize=32)
+def _normalize_image_bytes(raw: bytes) -> bytes:
+    """Decode `raw` as an actual image (rejecting MIME-spoofed payloads
+    that only look valid because the declared data: URL header said so)
+    and downscale it if it is larger than needed for vision inference."""
+
+    try:
+        from PIL import Image
+    except ImportError:
+        # OCR/vision extras not installed in this environment; fall back
+        # to trusting the declared header, same as before this change.
+        return raw
+
+    import io
+
+    try:
+
+        with Image.open(io.BytesIO(raw)) as img:
+
+            img.load()
+
+            width, height = img.size
+            longest_edge = max(width, height)
+
+            if longest_edge <= MAX_IMAGE_EDGE_PX:
+                return raw
+
+            scale = MAX_IMAGE_EDGE_PX / longest_edge
+
+            resized = img.convert("RGB").resize(
+                (
+                    max(1, round(width * scale)),
+                    max(1, round(height * scale)),
+                ),
+                Image.LANCZOS,
+            )
+
+            buffer = io.BytesIO()
+            resized.save(buffer, format="JPEG", quality=90)
+            return buffer.getvalue()
+
+    except Exception as exc:
+
+        raise ValueError(
+            "Image data is corrupt or not a valid image"
+        ) from exc
+
+
 def get_message_image_data(
     message: ChatMessage,
 ) -> List[str]:
@@ -578,8 +713,12 @@ def get_message_image_data(
                 "Each image must be 10 MB or smaller"
             )
 
+        raw = _normalize_image_bytes(raw)
+
         # Ollama expects the base64 payload without the data URL header.
-        images.append(encoded)
+        images.append(
+            base64.b64encode(raw).decode("ascii")
+        )
 
     return images
 
@@ -1573,6 +1712,55 @@ def _warm_up_local_models() -> None:
             f"{type(exc).__name__}: {exc}"
         )
 
+    try:
+        run_ollama_gpu(
+            [
+                ChatMessage(
+                    role="user",
+                    content="ping",
+                )
+            ],
+            1,
+            0.0,
+            OLLAMA_MODEL_VISION,
+        )
+
+        print("[WARMUP] Vision model ready.")
+
+    except Exception as exc:
+        print(
+            "[WARMUP] Vision model skipped: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    if not OCR_DEPENDENCIES_PRESENT:
+        print("[WARMUP] OCR skipped: dependencies not present.")
+    else:
+        try:
+            from PIL import Image
+            import io
+
+            buffer = io.BytesIO()
+            Image.new(
+                "RGB",
+                (8, 8),
+                color="white",
+            ).save(buffer, format="PNG")
+
+            parse_document(
+                buffer.getvalue(),
+                filename="warmup.png",
+                language="korean",
+            )
+
+            print("[WARMUP] OCR ready.")
+
+        except Exception as exc:
+            print(
+                "[WARMUP] OCR skipped: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
 
 @app.on_event("startup")
 async def startup_warm_up() -> None:
@@ -1730,6 +1918,9 @@ def run_ollama_gpu(
     temperature: float,
     ollama_model: str,
     tools: Optional[List[dict]] = None,
+    cancelled: Optional[threading.Event] = None,
+    upstream_response: Optional[list] = None,
+    upstream_response_lock: Optional[threading.Lock] = None,
 ):
 
     payload = {
@@ -1740,7 +1931,16 @@ def run_ollama_gpu(
                 messages
             ),
 
-        "stream": False,
+        # Ollama is asked to stream internally even though this function's
+        # caller wants one final message, not chunks. A stream:false call
+        # returns nothing at all — headers or body — until generation is
+        # fully finished, so a disconnected client's response can't be
+        # closed early: there's nothing open to close. Streaming internally
+        # gets a response object as soon as generation starts, so a
+        # disconnect can close the socket mid-generation and free
+        # ollama_lock immediately, the same way the SSE endpoint already
+        # does; the lines are then accumulated into one message below.
+        "stream": True,
 
         # Qwen3의 reasoning을 사용자에게
         # 노출하지 않고 일반 응답 모드 사용
@@ -1804,23 +2004,96 @@ def run_ollama_gpu(
     )
 
 
+    lock_wait_start = time.perf_counter()
+    lock_wait_seconds = 0.0
+    lock_acquired = False
+
+    content_parts: List[str] = []
+    tool_calls_accum: List[dict] = []
+    result: dict = {}
+
     try:
 
-        with ollama_lock:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Request cancelled before GPU lock acquired")
 
-            with urllib.request.urlopen(
-                request,
-                timeout=600,
-            ) as response:
-
-                body = response.read()
-
-
-        result = json.loads(
-            body.decode(
-                "utf-8"
-            )
+        lock_acquired = ollama_lock.acquire(
+            timeout=OLLAMA_LOCK_WAIT_SECONDS
         )
+
+        lock_wait_seconds = (
+            time.perf_counter() - lock_wait_start
+        )
+
+        if not lock_acquired:
+            raise GPUBusyError(
+                "GPU is busy handling other requests; please retry"
+            )
+
+        try:
+
+            if cancelled is not None and cancelled.is_set():
+                raise RuntimeError("Request cancelled while waiting for GPU lock")
+
+            try:
+
+                with urllib.request.urlopen(
+                    request,
+                    timeout=600,
+                ) as response:
+
+                    if upstream_response is not None:
+                        with upstream_response_lock:
+                            upstream_response[0] = response
+
+                    for raw_line in response:
+
+                        if cancelled is not None and cancelled.is_set():
+                            raise RuntimeError(
+                                "Request cancelled during GPU generation"
+                            )
+
+                        if not raw_line:
+                            continue
+
+                        line = raw_line.decode("utf-8").strip()
+
+                        if not line:
+                            continue
+
+                        obj = json.loads(line)
+
+                        message = obj.get("message", {})
+
+                        text = message.get("content", "")
+
+                        if text:
+                            content_parts.append(text)
+
+                        tool_calls = message.get("tool_calls", [])
+
+                        if tool_calls:
+                            tool_calls_accum.extend(tool_calls)
+
+                        if obj.get("done", False):
+                            result = obj
+                            break
+
+            finally:
+
+                if upstream_response is not None:
+                    with upstream_response_lock:
+                        upstream_response[0] = None
+
+        finally:
+
+            if lock_acquired:
+                ollama_lock.release()
+
+
+    except GPUBusyError:
+
+        raise
 
 
     except urllib.error.HTTPError as exc:
@@ -1842,16 +2115,7 @@ def run_ollama_gpu(
         )
 
 
-    message = result.get(
-        "message",
-        {},
-    )
-
-
-    content = message.get(
-        "content",
-        "",
-    ).strip()
+    content = "".join(content_parts).strip()
 
     metrics = {
         "ollama_total_seconds":
@@ -1916,16 +2180,138 @@ def run_ollama_gpu(
             result.get(
                 "done_reason"
             ),
+
+        "lock_wait_seconds":
+            round(
+                lock_wait_seconds,
+                3,
+            ),
     }
 
     return (
         content,
         metrics,
-        message.get(
-            "tool_calls",
-            [],
-        ),
+        tool_calls_accum,
     )
+
+
+async def run_ollama_gpu_watched(
+    http_request: Request,
+    messages: List[ChatMessage],
+    max_tokens: int,
+    temperature: float,
+    ollama_model: str,
+    tools: Optional[List[dict]] = None,
+):
+    """Same as run_ollama_gpu, but abandons the generation and releases
+    ollama_lock as soon as the client disconnects, instead of holding the
+    lock (and blocking every other GPU request) for up to the 600s socket
+    timeout."""
+
+    loop = asyncio.get_running_loop()
+
+    done_event = asyncio.Event()
+
+    cancelled = threading.Event()
+
+    upstream_response = [None]
+    upstream_response_lock = threading.Lock()
+
+    result_box = {}
+
+    def close_upstream_response():
+        with upstream_response_lock:
+            response = upstream_response[0]
+            upstream_response[0] = None
+
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def worker():
+
+        try:
+
+            result_box["value"] = run_ollama_gpu(
+                messages,
+                max_tokens,
+                temperature,
+                ollama_model,
+                tools,
+                cancelled=cancelled,
+                upstream_response=upstream_response,
+                upstream_response_lock=upstream_response_lock,
+            )
+
+        except Exception as exc:
+
+            result_box["error"] = exc
+
+        finally:
+
+            loop.call_soon_threadsafe(done_event.set)
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+    ).start()
+
+    # `Request.is_disconnected()` polls receive() with a near-zero timeout
+    # and, outside of Starlette's own StreamingResponse machinery, never
+    # actually observes a client disconnect for a plain (non-streaming)
+    # response — confirmed by testing. A bare `await receive()` loop is
+    # the mechanism StreamingResponse itself uses internally and is the
+    # one proven (by the working SSE disconnect handling elsewhere in this
+    # file) to actually see the disconnect event.
+    async def wait_for_disconnect() -> None:
+        try:
+            while True:
+                message = await http_request.receive()
+                if message.get("type") == "http.disconnect":
+                    return
+        except Exception:
+            return
+
+    done_task = asyncio.ensure_future(done_event.wait())
+    disconnect_task = asyncio.ensure_future(wait_for_disconnect())
+
+    try:
+
+        await asyncio.wait(
+            {done_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done_event.is_set():
+
+            cancelled.set()
+            close_upstream_response()
+
+        await done_event.wait()
+
+    finally:
+
+        cancelled.set()
+        close_upstream_response()
+
+        for task in (done_task, disconnect_task):
+
+            task.cancel()
+
+            try:
+                await task
+            except BaseException:
+                # Includes asyncio.CancelledError, which is a
+                # BaseException (not Exception) since Python 3.8 and is
+                # expected here: we just cancelled this exact task.
+                pass
+
+    if "error" in result_box:
+        raise result_box["error"]
+
+    return result_box["value"]
 
 
 # ============================================================
@@ -2824,8 +3210,8 @@ def root():
 @app.post("/v1/ocr")
 async def ocr_document(
     file: UploadFile = File(...),
-    language: str = "korean",
-    force_ocr: bool = False,
+    language: str = Form("korean"),
+    force_ocr: bool = Form(False),
 ):
     data = await file.read(MAX_DOCUMENT_BYTES + 1)
     if len(data) > MAX_DOCUMENT_BYTES:
@@ -3488,8 +3874,8 @@ async def chat_completions(
                 output,
                 ollama_metrics,
                 ollama_tool_calls,
-            ) = await asyncio.to_thread(
-                run_ollama_gpu,
+            ) = await run_ollama_gpu_watched(
+                http_request,
 
                 effective_messages,
 
@@ -3504,6 +3890,19 @@ async def chat_completions(
 
 
             device = "GPU"
+
+
+    except GPUBusyError as exc:
+
+        print(
+            "GPU busy:",
+            repr(exc),
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        )
 
 
     except Exception as exc:
@@ -3813,6 +4212,15 @@ async def chat_completions(
                             "model_load_seconds"
                         ) is not None
                     )
+                    else None
+                ),
+
+            "lock_wait_seconds":
+                (
+                    ollama_metrics.get(
+                        "lock_wait_seconds"
+                    )
+                    if device == "GPU"
                     else None
                 ),
 
