@@ -884,6 +884,16 @@ RAG_KEYWORDS = (
     "storage",
     "스토리지",
     "멀티패스",
+    # rag_engine already reranks on these anchors, but a question that
+    # mentions only them (no "rhel"/"storage") never reached RAG at all.
+    "selinux",
+    "systemd",
+    "firewalld",
+    "firewall-cmd",
+    "iptables",
+    "nftables",
+    "networkmanager",
+    "nmcli",
 )
 
 OPENSHIFT_RAG_KEYWORDS = (

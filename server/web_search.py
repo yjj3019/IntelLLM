@@ -35,9 +35,11 @@ LIVE_PATTERNS = (
     "강수",
     "태풍",
     "기상",
-    "오늘",
-    "내일",
-    "이번 주",
+    # "오늘"/"내일"/"이번 주" were removed: they matched on their own in
+    # plain non-live prose ("오늘 배운 내용 정리해줘", a date-format
+    # question containing "오늘 날짜 형식"), and every genuinely live
+    # case they were meant to catch (오늘 뉴스, 오늘 환율, 오늘 날씨...)
+    # is already covered by its own more specific keyword below.
     "최신",
     "최근",
     "실시간",
@@ -61,6 +63,17 @@ LIVE_PATTERNS = (
     "web search",
     "search the web",
     "latest",
+    "weather",
+    "forecast",
+    "temperature",
+    "rain",
+    "snow",
+    "humidity",
+    "typhoon",
+    "storm",
+    "current time",
+    "what time is it",
+    "what's the time",
 )
 
 WEATHER_PATTERNS = (
@@ -69,6 +82,14 @@ WEATHER_PATTERNS = (
     "강수",
     "태풍",
     "기상",
+    "weather",
+    "forecast",
+    "temperature",
+    "rain",
+    "snow",
+    "humidity",
+    "typhoon",
+    "storm",
 )
 
 TIME_PATTERNS = (
@@ -79,6 +100,9 @@ TIME_PATTERNS = (
     "지금 몇 시",
     "몇 시",
     "몇시",
+    "current time",
+    "what time is it",
+    "what's the time",
 )
 
 LOCATION_ALIASES = {
@@ -95,6 +119,25 @@ LOCATION_ALIASES = {
     "광주": (35.1595, 126.8526),
     "울산": (35.5384, 129.3114),
     "제주": (33.4996, 126.5312),
+    # English weather prompts now reach the weather path, so the same
+    # cities need ASCII keys too — otherwise _geocode() is handed a whole
+    # English sentence and the lookup fails.
+    # ponytail: alias table only; an English city that isn't listed still
+    # falls through to _geocode() on the raw sentence and fails. Add a
+    # proper place-name extractor only if non-Korean cities get asked for.
+    "seoul": (37.5665, 126.9780),
+    "incheon": (37.4563, 126.7052),
+    "gimpo": (37.6153, 126.7156),
+    "suwon": (37.2636, 127.0286),
+    "seongnam": (37.4449, 127.1389),
+    "goyang": (37.6584, 126.8320),
+    "paju": (37.7600, 126.7800),
+    "busan": (35.1796, 129.0756),
+    "daegu": (35.8714, 128.6014),
+    "daejeon": (36.3504, 127.3845),
+    "gwangju": (35.1595, 126.8526),
+    "ulsan": (35.5384, 129.3114),
+    "jeju": (33.4996, 126.5312),
 }
 
 OFFICIAL_DOMAIN_HINTS = (
@@ -337,12 +380,57 @@ WEATHER_CODES = {
 }
 
 
+# A game name alone is not a live-info signal — "롤이 몇 년도에 출시됐어?"
+# is trivia, not a request for current patch/server state. Require one of
+# these alongside the game name before treating it as a live query; a
+# prompt that already matches LIVE_PATTERNS (최신, 최근, ...) doesn't need
+# this check at all.
+GAME_INTENT_PATTERNS = (
+    "패치",
+    "업데이트",
+    "공지",
+    "이벤트",
+    "점검",
+    "서버 상태",
+    "다운로드",
+    "랭크",
+    "시즌",
+    "신규",
+    "밸런스",
+    "너프",
+    "버프",
+    "patch",
+    "update",
+    "news",
+    "maintenance",
+    "event",
+    "season",
+    "release notes",
+    "changelog",
+)
+
+
+# "오늘 날짜 형식(YYYY-MM-DD)을 설명해줘" asks about a date FORMAT, not
+# today's date, so a date/time literal alone must not make it live when a
+# format word is present. Other live signals (날씨, 뉴스, ...) still count.
+FORMAT_WORDS = ("형식", "포맷", "표기", "format")
+
+
 def is_live_query(prompt: str) -> bool:
     value = prompt.lower()
-    return (
-        any(pattern in value for pattern in LIVE_PATTERNS)
-        or detect_game_profile(prompt) is not None
-    )
+
+    hits = [pattern for pattern in LIVE_PATTERNS if pattern in value]
+    if any(word in value for word in FORMAT_WORDS):
+        hits = [pattern for pattern in hits if pattern not in TIME_PATTERNS]
+    if hits:
+        return True
+
+    if detect_game_profile(prompt) is not None and any(
+        pattern in value for pattern in GAME_INTENT_PATTERNS
+    ):
+        return True
+
+    return False
 
 
 def detect_game_profile(prompt: str):
@@ -542,7 +630,7 @@ def _location_from_prompt(prompt: str):
         key=lambda item: len(item[0]),
         reverse=True,
     ):
-        if name in prompt:
+        if name in prompt.lower():
             return name, coordinates
 
     cleaned = re.sub(
