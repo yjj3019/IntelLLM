@@ -1891,6 +1891,73 @@ def ollama_tags() -> Optional[set]:
         return None
 
 
+def ollama_running_models() -> Optional[List[dict]]:
+    """Currently loaded Ollama models with their VRAM residency, or None
+    when the daemon is unreachable.
+
+    `/api/ps`'s `size_vram` silently drops to 0 (full CPU fallback, several
+    times slower) when something upstream of Ollama loses GPU access — a
+    stray duplicate `ollama serve` process claiming the GPU device was
+    observed doing exactly this. /health surfaces it here instead of only
+    reporting "the daemon answered".
+    """
+
+    try:
+
+        request = urllib.request.Request(
+            OLLAMA_BASE_URL
+            + "/api/ps",
+            method="GET",
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=3,
+        ) as response:
+
+            if response.status != 200:
+                return None
+
+            body = json.loads(
+                response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+        results = []
+
+        for entry in body.get("models", []):
+
+            size = entry.get("size") or 0
+            size_vram = entry.get("size_vram") or 0
+
+            results.append({
+                "model":
+                    entry.get("model")
+                    or entry.get("name")
+                    or "",
+
+                "size_vram":
+                    size_vram,
+
+                "size":
+                    size,
+
+                "fully_offloaded":
+                    size > 0 and size_vram >= size,
+
+                "on_gpu":
+                    size_vram > 0,
+            })
+
+        return results
+
+    except Exception:
+
+        return None
+
+
 # ============================================================
 # Ollama model mapping
 # ============================================================
@@ -3265,6 +3332,33 @@ def health():
         else False
     )
 
+    running = ollama_running_models()
+
+    running_on_cpu = (
+        [
+            entry["model"]
+            for entry in running
+            if not entry["on_gpu"]
+        ]
+        if running is not None
+        else []
+    )
+
+    gpu_status = (
+        "ready"
+        if main_model_installed
+        else "degraded"
+        if ollama_ready
+        else "unavailable"
+    )
+
+    if gpu_status == "ready" and running_on_cpu:
+        # A model can be installed and the daemon reachable while actually
+        # running on CPU only — e.g. a stray duplicate `ollama serve`
+        # process holding the GPU device. That is a real degradation the
+        # simpler checks above cannot see.
+        gpu_status = "degraded"
+
 
     return {
         "status":
@@ -3296,16 +3390,11 @@ def health():
         },
 
         "gpu": {
-            # "ready" means the daemon answered and the main model is
-            # installed; it does not claim the model is loaded on device.
+            # "ready" means the daemon answered, the main model is
+            # installed, and no currently loaded model is stuck running on
+            # CPU only (see running_on_cpu below).
             "status":
-                (
-                    "ready"
-                    if main_model_installed
-                    else "degraded"
-                    if ollama_ready
-                    else "unavailable"
-                ),
+                gpu_status,
 
             "main_model_installed":
                 main_model_installed,
@@ -3324,6 +3413,12 @@ def health():
 
             "vision_model":
                 OLLAMA_MODEL_VISION,
+
+            "loaded_models":
+                running,
+
+            "running_on_cpu":
+                running_on_cpu,
         },
 
         # Dependencies are probed at import time; the OCR models are
