@@ -14,7 +14,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from rag_engine import build_rag_context, warm_up_rag
+from rag_engine import (
+    DEFAULT_TOP_K as DEFAULT_RAG_TOP_K,
+    build_rag_context,
+    warm_up_rag,
+)
 from web_search import (
     fetch_live_context,
     is_live_query as is_web_live_query,
@@ -1145,7 +1149,7 @@ def build_effective_gpu_messages(
             query=last_user,
             product=product,
             version=version,
-            limit=2,
+            limit=DEFAULT_RAG_TOP_K,
         )
 
 

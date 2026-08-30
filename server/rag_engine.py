@@ -22,7 +22,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 COLLECTION = "redhat_docs"
 EMBED_MODEL = "intfloat/multilingual-e5-base"
 
-DEFAULT_TOP_K = 2
+DEFAULT_TOP_K = 3
 DEFAULT_CANDIDATES = 12
 
 RAG_EXCERPT_CHARS = 1400
