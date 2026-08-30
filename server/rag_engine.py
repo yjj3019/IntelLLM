@@ -1,13 +1,24 @@
+import os
 import re
 import threading
 from typing import List, Optional, Tuple
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ["NO_PROXY"] = ",".join(dict.fromkeys(
+    [part.strip() for part in os.getenv("NO_PROXY", "").split(",") if part.strip()]
+    + ["192.168.1.3", "127.0.0.1", "localhost"]
+))
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
 
 
-QDRANT_URL = "http://127.0.0.1:6333"
+QDRANT_URL = os.getenv(
+    "QDRANT_URL",
+    "http://192.168.1.3:6333",
+).rstrip("/")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 COLLECTION = "redhat_docs"
 EMBED_MODEL = "intfloat/multilingual-e5-base"
 
@@ -116,6 +127,7 @@ def get_qdrant_client() -> QdrantClient:
             if _qdrant_client is None:
                 _qdrant_client = QdrantClient(
                     url=QDRANT_URL,
+                    api_key=QDRANT_API_KEY,
                     timeout=30,
                 )
 

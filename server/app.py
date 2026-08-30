@@ -1,5 +1,10 @@
 import asyncio
+import base64
+import binascii
+import hmac
+import importlib.util
 import json
+import os
 import re
 import threading
 import time
@@ -13,20 +18,28 @@ from web_search import (
     fetch_live_context,
     is_live_query as is_web_live_query,
 )
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, Union
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import openvino_genai as ov_genai
+
+from ocr_engine import (
+    MAX_DOCUMENT_BYTES,
+    OCRDependencyError,
+    OCRInputError,
+    parse_document,
+)
 
 
 # ============================================================
 # Version
 # ============================================================
 
-VERSION = "0.11.14"
+VERSION = "0.12.0"
 
 
 # ============================================================
@@ -36,6 +49,92 @@ VERSION = "0.11.14"
 app = FastAPI(
     title="Intel Local AI Router",
     version=VERSION,
+)
+
+# ============================================================
+# Optional API key protection for /v1/*
+#
+# Unset LOCAL_AI_API_KEY keeps the previous open behavior.
+# /health, /, /route stay public either way.
+# ============================================================
+
+API_KEY = os.environ.get(
+    "LOCAL_AI_API_KEY",
+    "",
+).strip()
+
+
+def _presented_api_key(
+    request: Request,
+) -> str:
+
+    header = request.headers.get(
+        "x-api-key",
+        "",
+    ).strip()
+
+    if header:
+        return header
+
+    authorization = request.headers.get(
+        "authorization",
+        "",
+    ).strip()
+
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+
+    return authorization
+
+
+# Registered before CORS so the CORS middleware stays outermost
+# and preflight/error responses keep their CORS headers.
+@app.middleware("http")
+async def api_key_guard(
+    request: Request,
+    call_next,
+):
+
+    if (
+        API_KEY
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/v1/")
+    ):
+
+        # Compare as bytes: compare_digest rejects non-ASCII str.
+        if not hmac.compare_digest(
+            _presented_api_key(request).encode("utf-8"),
+            API_KEY.encode("utf-8"),
+        ):
+
+            # Never log or echo the presented credential.
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": {
+                        "message":
+                            "invalid or missing API key",
+
+                        "type":
+                            "invalid_request_error",
+                    }
+                },
+            )
+
+    return await call_next(request)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://192.168.1.3:3080",
+        "http://192.168.0.112:3080",
+        "http://localhost:3080",
+        "http://127.0.0.1:3080",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -68,9 +167,22 @@ OLLAMA_CHAT_URL = (
 
 OLLAMA_MODEL_MAIN = "qwen3:8b"
 OLLAMA_MODEL_DEEP = "qwen3:14b"
+OLLAMA_MODEL_VISION = "gemma3:12b"
 
 # Ollama가 모델을 GPU 메모리에 유지하는 시간
 OLLAMA_KEEP_ALIVE = "5m"
+
+# Keep image handling local, bounded, and zero-copy after base64 validation.
+IMAGE_PART_TYPES = {"image_url", "input_image"}
+IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+}
+MAX_IMAGE_COUNT = 4
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
 
 
 # ============================================================
@@ -101,14 +213,19 @@ print("=" * 60)
 
 print("Loading NPU FAST...")
 
-npu_fast = ov_genai.LLMPipeline(
-    NPU_FAST_MODEL,
-    "NPU",
-    CACHE_DIR=NPU_FAST_CACHE,
-    MAX_PROMPT_LEN=NPU_MAX_PROMPT_LEN,
-)
-
-print("NPU FAST loaded.")
+npu_fast = None
+NPU_FAST_ERROR = ""
+try:
+    npu_fast = ov_genai.LLMPipeline(
+        NPU_FAST_MODEL,
+        "NPU",
+        CACHE_DIR=NPU_FAST_CACHE,
+        MAX_PROMPT_LEN=NPU_MAX_PROMPT_LEN,
+    )
+    print("NPU FAST loaded.")
+except Exception as exc:
+    NPU_FAST_ERROR = f"{type(exc).__name__}: {exc}"
+    print(f"NPU FAST unavailable: {NPU_FAST_ERROR}")
 
 print(
     f"GPU main backend: Ollama / {OLLAMA_MODEL_MAIN}"
@@ -132,6 +249,20 @@ print("Startup complete.")
 npu_lock = threading.Lock()
 
 ollama_lock = threading.Lock()
+
+# How often a streaming response re-checks client disconnect while the
+# backend is silent. Without this the SSE loop parks on queue.get()
+# forever and the worker keeps the device lock for the full HTTP timeout.
+STREAM_POLL_SECONDS = 0.5
+
+# ponytail: single in-flight OCR job; raise if throughput ever matters.
+ocr_semaphore = asyncio.Semaphore(1)
+
+# Lightweight readiness probe: import specs only, no model load.
+OCR_DEPENDENCIES_PRESENT = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("numpy", "pymupdf", "PIL", "rapidocr")
+)
 
 
 # ============================================================
@@ -247,6 +378,8 @@ def choose_model(
 
     # Short arithmetic is a safe, low-latency NPU workload.
     if (
+        npu_fast is not None
+        and
         len(prompt) <= 48
         and re.search(
             r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?![A-Za-z0-9])",
@@ -261,7 +394,7 @@ def choose_model(
 
 
     # 명확한 단순 작업만 NPU
-    if any(
+    if npu_fast is not None and any(
         pattern in text
         for pattern in SIMPLE_PATTERNS
     ):
@@ -283,9 +416,16 @@ class ChatMessage(BaseModel):
         "system",
         "user",
         "assistant",
+        "tool",
     ]
 
-    content: str
+    content: Optional[Union[str, List[dict]]] = ""
+
+    tool_calls: Optional[List[dict]] = None
+
+    tool_call_id: Optional[str] = None
+
+    name: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -302,6 +442,8 @@ class ChatCompletionRequest(BaseModel):
 
     stream: Optional[bool] = False
 
+    tools: Optional[List[dict]] = None
+
 
 class RouteRequest(BaseModel):
 
@@ -312,6 +454,179 @@ class RouteRequest(BaseModel):
 # Helpers
 # ============================================================
 
+def get_message_text(
+    message: ChatMessage,
+) -> str:
+
+    content = message.content
+
+    if isinstance(content, str):
+
+        return content
+
+    if not isinstance(content, list):
+
+        return ""
+
+    text_parts = []
+
+    for part in content:
+
+        if not isinstance(part, dict):
+
+            continue
+
+        if part.get("type") != "text":
+
+            continue
+
+        text = part.get("text")
+
+        if isinstance(text, str):
+
+            text_parts.append(text)
+
+    return "\n".join(text_parts).strip()
+
+
+def get_message_image_data(
+    message: ChatMessage,
+) -> List[str]:
+
+    content = message.content
+
+    if not isinstance(content, list):
+
+        return []
+
+    images = []
+
+    for part in content:
+
+        if not isinstance(part, dict):
+
+            continue
+
+        if part.get("type") not in IMAGE_PART_TYPES:
+
+            continue
+
+        image_url = part.get("image_url")
+
+        if isinstance(image_url, dict):
+
+            image_url = image_url.get("url", "")
+
+        if not isinstance(image_url, str) or not image_url:
+
+            raise ValueError(
+                "image_url must contain a data:image/*;base64 URL"
+            )
+
+        if not image_url.lower().startswith("data:image/"):
+
+            raise ValueError(
+                "Only local data:image/*;base64 images are supported"
+            )
+
+        try:
+
+            header, encoded = image_url.split(",", 1)
+
+        except ValueError as exc:
+
+            raise ValueError(
+                "Invalid image data URL"
+            ) from exc
+
+        header_parts = header.lower().split(";")
+        mime_type = header_parts[0][5:]
+
+        if (
+            mime_type not in IMAGE_MIME_TYPES
+            or "base64" not in header_parts[1:]
+        ):
+
+            raise ValueError(
+                "Image must be JPEG, PNG, WEBP, or GIF base64 data"
+            )
+
+        encoded = "".join(encoded.split())
+
+        try:
+
+            raw = base64.b64decode(
+                encoded,
+                validate=True,
+            )
+
+        except (binascii.Error, ValueError) as exc:
+
+            raise ValueError(
+                "Invalid base64 image data"
+            ) from exc
+
+        if not raw:
+
+            raise ValueError(
+                "Image data must not be empty"
+            )
+
+        if len(raw) > MAX_IMAGE_BYTES:
+
+            raise ValueError(
+                "Each image must be 10 MB or smaller"
+            )
+
+        # Ollama expects the base64 payload without the data URL header.
+        images.append(encoded)
+
+    return images
+
+
+def request_has_images(
+    messages: List[ChatMessage],
+) -> bool:
+
+    return any(
+        isinstance(message.content, list)
+        and any(
+            isinstance(part, dict)
+            and part.get("type") in IMAGE_PART_TYPES
+            for part in message.content
+        )
+        for message in messages
+    )
+
+
+def validate_request_images(
+    messages: List[ChatMessage],
+) -> None:
+
+    image_count = 0
+    encoded_bytes = 0
+
+    for message in messages:
+
+        images = get_message_image_data(message)
+        image_count += len(images)
+        encoded_bytes += sum(
+            len(image)
+            for image in images
+        )
+
+    if image_count > MAX_IMAGE_COUNT:
+
+        raise ValueError(
+            f"A request may contain at most {MAX_IMAGE_COUNT} images"
+        )
+
+    if encoded_bytes > MAX_IMAGE_TOTAL_BYTES * 4 // 3 + 4:
+
+        raise ValueError(
+            "Total image data must be 20 MB or smaller"
+        )
+
 def get_last_user_message(
     messages: List[ChatMessage],
 ) -> str:
@@ -320,7 +635,7 @@ def get_last_user_message(
 
         if message.role == "user":
 
-            return message.content
+            return get_message_text(message)
 
     return ""
 
@@ -766,21 +1081,21 @@ def messages_to_npu_prompt(
         if message.role == "system":
 
             parts.append(
-                f"System: {message.content}"
+                f"System: {get_message_text(message)}"
             )
 
 
         elif message.role == "user":
 
             parts.append(
-                f"User: {message.content}"
+                f"User: {get_message_text(message)}"
             )
 
 
         elif message.role == "assistant":
 
             parts.append(
-                f"Assistant: {message.content}"
+                f"Assistant: {get_message_text(message)}"
             )
 
 
@@ -798,6 +1113,9 @@ def npu_prompt_token_count(
     messages: List[ChatMessage],
 ) -> int:
 
+    if npu_fast is None:
+        raise RuntimeError("NPU backend is unavailable")
+
     encoded = npu_fast.get_tokenizer().encode(
         messages_to_npu_prompt(messages)
     )
@@ -806,6 +1124,60 @@ def npu_prompt_token_count(
     return int(
         encoded.input_ids.get_shape()[-1]
     )
+
+
+def _usage_block(
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+) -> dict:
+    """OpenAI-shaped usage. Unknown counts stay null rather than zero."""
+
+    return {
+        "prompt_tokens":
+            prompt_tokens,
+
+        "completion_tokens":
+            completion_tokens,
+
+        "total_tokens":
+            (
+                prompt_tokens + completion_tokens
+                if (
+                    prompt_tokens is not None
+                    and completion_tokens is not None
+                )
+                else None
+            ),
+    }
+
+
+def npu_text_token_count(
+    text: str,
+) -> Optional[int]:
+    """Measured token count for NPU text, or None when it cannot be measured.
+
+    Never fabricate a zero here: callers surface this straight into `usage`.
+    """
+
+    if npu_fast is None:
+        return None
+
+    if not text:
+        return 0
+
+    try:
+
+        encoded = npu_fast.get_tokenizer().encode(
+            text
+        )
+
+        return int(
+            encoded.input_ids.get_shape()[-1]
+        )
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
@@ -864,6 +1236,9 @@ def run_npu_fast(
     temperature: float,
 ) -> str:
 
+    if npu_fast is None:
+        raise RuntimeError("NPU backend is unavailable")
+
     prompt = messages_to_npu_prompt(
         messages
     )
@@ -892,21 +1267,267 @@ def run_npu_fast(
 # Ollama message converter
 # ============================================================
 
+def _tool_call_function(
+    tool_call: dict,
+) -> dict:
+
+    function = tool_call.get(
+        "function",
+        {},
+    )
+
+    arguments = function.get(
+        "arguments",
+        {},
+    )
+
+    if isinstance(
+        arguments,
+        str,
+    ):
+
+        try:
+
+            arguments = json.loads(
+                arguments
+            )
+
+        except json.JSONDecodeError:
+
+            arguments = {}
+
+
+    return {
+        "name": function.get(
+            "name",
+            "",
+        ),
+
+        "arguments": arguments,
+    }
+
+
+def to_openai_tool_calls(
+    tool_calls: Optional[List[dict]],
+    ids_by_index: Optional[dict] = None,
+    include_index: bool = False,
+) -> List[dict]:
+
+    result = []
+
+    if ids_by_index is None:
+
+        ids_by_index = {}
+
+
+    for position, tool_call in enumerate(
+        tool_calls or []
+    ):
+
+        function = tool_call.get(
+            "function",
+            {},
+        )
+
+        name = function.get(
+            "name",
+            "",
+        )
+
+        if not name:
+
+            continue
+
+
+        index = tool_call.get(
+            "index",
+            function.get(
+                "index",
+                position,
+            ),
+        )
+
+        call_id = tool_call.get(
+            "id"
+        ) or ids_by_index.get(
+            index
+        )
+
+        if not call_id:
+
+            call_id = (
+                "call_"
+                + uuid.uuid4().hex[:12]
+            )
+
+            ids_by_index[index] = call_id
+
+        else:
+
+            ids_by_index[index] = call_id
+
+
+        arguments = function.get(
+            "arguments",
+            {},
+        )
+
+        if not isinstance(
+            arguments,
+            str,
+        ):
+
+            arguments = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                separators=(
+                    ",",
+                    ":",
+                ),
+            )
+
+
+        converted = {
+            "id": call_id,
+
+            "type": "function",
+
+            "function": {
+                "name": name,
+
+                "arguments": arguments,
+            },
+        }
+
+        if include_index:
+
+            converted[
+                "index"
+            ] = index
+
+
+        result.append(
+            converted
+        )
+
+
+    return result
+
+
 def build_ollama_messages(
     messages: List[ChatMessage],
 ):
 
     result = []
 
+    tool_names_by_id = {}
+
 
     for message in messages:
 
-        result.append(
-            {
-                "role": message.role,
-                "content": message.content,
+        if message.role == "assistant":
+
+            item = {
+                "role": "assistant",
+
+                "content": get_message_text(message),
             }
-        )
+
+            images = get_message_image_data(message)
+
+            if images:
+
+                item["images"] = images
+
+            if message.tool_calls:
+
+                item[
+                    "tool_calls"
+                ] = [
+                    {
+                        "function":
+                            _tool_call_function(
+                                tool_call
+                            ),
+                    }
+                    for tool_call in
+                    message.tool_calls
+                ]
+
+                for tool_call in message.tool_calls:
+
+                    function = tool_call.get(
+                        "function",
+                        {},
+                    )
+
+                    call_id = tool_call.get(
+                        "id"
+                    )
+
+                    name = function.get(
+                        "name",
+                        "",
+                    )
+
+                    if call_id and name:
+
+                        tool_names_by_id[
+                            call_id
+                        ] = name
+
+
+            result.append(item)
+
+            continue
+
+
+        if message.role == "tool":
+
+            item = {
+                "role": "tool",
+
+                "content": get_message_text(message),
+            }
+
+            images = get_message_image_data(message)
+
+            if images:
+
+                item["images"] = images
+
+            tool_name = (
+                message.name
+                or tool_names_by_id.get(
+                    message.tool_call_id
+                )
+            )
+
+            if tool_name:
+
+                item[
+                    "tool_name"
+                ] = tool_name
+
+
+            result.append(item)
+
+            continue
+
+
+        item = {
+            "role": message.role,
+
+            "content": get_message_text(message),
+        }
+
+        images = get_message_image_data(message)
+
+        if images:
+
+            item["images"] = images
+
+        result.append(item)
 
 
     return result
@@ -919,25 +1540,28 @@ def build_ollama_messages(
 def _warm_up_local_models() -> None:
     """Remove the first-request penalty without delaying health startup."""
 
-    try:
-        config = make_npu_config(
-            max_tokens=1,
-            temperature=0.0,
-        )
-
-        with npu_lock:
-            npu_fast.generate(
-                "User: 준비\nAssistant:",
-                config,
+    if npu_fast is None:
+        print(f"[WARMUP] NPU skipped: {NPU_FAST_ERROR}")
+    else:
+        try:
+            config = make_npu_config(
+                max_tokens=1,
+                temperature=0.0,
             )
 
-        print("[WARMUP] NPU ready.")
+            with npu_lock:
+                npu_fast.generate(
+                    "User: 준비\nAssistant:",
+                    config,
+                )
 
-    except Exception as exc:
-        print(
-            "[WARMUP] NPU skipped: "
-            f"{type(exc).__name__}: {exc}"
-        )
+            print("[WARMUP] NPU ready.")
+
+        except Exception as exc:
+            print(
+                "[WARMUP] NPU skipped: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     try:
         warm_up_rag()
@@ -1037,7 +1661,11 @@ def clean_rag_answer(
 # Ollama health check
 # ============================================================
 
-def check_ollama() -> bool:
+def ollama_tags() -> Optional[set]:
+    """Installed Ollama model names, or None when the daemon is unreachable.
+
+    One short GET; the same cost as the old liveness-only probe.
+    """
 
     try:
 
@@ -1053,14 +1681,26 @@ def check_ollama() -> bool:
             timeout=3,
         ) as response:
 
-            return (
-                response.status == 200
+            if response.status != 200:
+                return None
+
+            body = json.loads(
+                response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
             )
+
+
+        return {
+            str(entry.get("model") or entry.get("name") or "")
+            for entry in body.get("models", [])
+        }
 
 
     except Exception:
 
-        return False
+        return None
 
 
 # ============================================================
@@ -1074,6 +1714,9 @@ def get_ollama_model(
     if api_model == "local-gpu-deep":
         return OLLAMA_MODEL_DEEP
 
+    if api_model == "local-vision":
+        return OLLAMA_MODEL_VISION
+
     return OLLAMA_MODEL_MAIN
 
 
@@ -1086,6 +1729,7 @@ def run_ollama_gpu(
     max_tokens: int,
     temperature: float,
     ollama_model: str,
+    tools: Optional[List[dict]] = None,
 ):
 
     payload = {
@@ -1112,6 +1756,13 @@ def run_ollama_gpu(
             ),
         },
     }
+
+
+    if tools:
+
+        payload[
+            "tools"
+        ] = tools
 
 
     if (
@@ -1267,7 +1918,14 @@ def run_ollama_gpu(
             ),
     }
 
-    return content, metrics
+    return (
+        content,
+        metrics,
+        message.get(
+            "tool_calls",
+            [],
+        ),
+    )
 
 
 # ============================================================
@@ -1287,6 +1945,8 @@ async def stream_npu_openai(
     queue = asyncio.Queue()
 
     done_marker = object()
+
+    cancelled = threading.Event()
 
 
     prompt = messages_to_npu_prompt(
@@ -1313,7 +1973,9 @@ async def stream_npu_openai(
             str(text),
         )
 
-        return False
+        # Returning True asks OpenVINO to stop generating, which
+        # releases npu_lock as soon as the client is gone.
+        return cancelled.is_set()
 
 
     # --------------------------------------------------------
@@ -1324,7 +1986,13 @@ async def stream_npu_openai(
 
         try:
 
+            if cancelled.is_set():
+                return
+
             with npu_lock:
+
+                if cancelled.is_set():
+                    return
 
                 npu_fast.generate(
                     prompt,
@@ -1359,100 +2027,115 @@ async def stream_npu_openai(
     # SSE
     # --------------------------------------------------------
 
-    while True:
+    try:
 
-        if await request.is_disconnected():
+        while True:
 
-            break
+            if await request.is_disconnected():
 
-
-        item = await queue.get()
-
-
-        if item is done_marker:
-
-            break
+                break
 
 
-        if isinstance(
-            item,
-            Exception,
-        ):
+            try:
 
-            error_chunk = {
-                "error": {
-                    "message":
-                        str(item),
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=STREAM_POLL_SECONDS,
+                )
 
-                    "type":
-                        "server_error",
+            except asyncio.TimeoutError:
+
+                continue
+
+
+            if item is done_marker:
+
+                break
+
+
+            if isinstance(
+                item,
+                Exception,
+            ):
+
+                error_chunk = {
+                    "error": {
+                        "message":
+                            str(item),
+
+                        "type":
+                            "server_error",
+                    }
                 }
+
+
+                yield (
+                    "data: "
+                    + json.dumps(
+                        error_chunk,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+
+                yield (
+                    "data: [DONE]\n\n"
+                )
+
+                return
+
+
+            text = str(item)
+
+
+            if not text:
+
+                continue
+
+
+            chunk = {
+                "id":
+                    completion_id,
+
+                "object":
+                    "chat.completion.chunk",
+
+                "created":
+                    int(time.time()),
+
+                "model":
+                    "local-npu-fast",
+
+                "choices": [
+                    {
+                        "index":
+                            0,
+
+                        "delta": {
+                            "content":
+                                text,
+                        },
+
+                        "finish_reason":
+                            None,
+                    }
+                ],
             }
 
 
             yield (
                 "data: "
                 + json.dumps(
-                    error_chunk,
+                    chunk,
                     ensure_ascii=False,
                 )
                 + "\n\n"
             )
 
+    finally:
 
-            yield (
-                "data: [DONE]\n\n"
-            )
-
-            return
-
-
-        text = str(item)
-
-
-        if not text:
-
-            continue
-
-
-        chunk = {
-            "id":
-                completion_id,
-
-            "object":
-                "chat.completion.chunk",
-
-            "created":
-                int(time.time()),
-
-            "model":
-                "local-npu-fast",
-
-            "choices": [
-                {
-                    "index":
-                        0,
-
-                    "delta": {
-                        "content":
-                            text,
-                    },
-
-                    "finish_reason":
-                        None,
-                }
-            ],
-        }
-
-
-        yield (
-            "data: "
-            + json.dumps(
-                chunk,
-                ensure_ascii=False,
-            )
-            + "\n\n"
-        )
+        cancelled.set()
 
 
     final_chunk = {
@@ -1510,6 +2193,7 @@ async def stream_ollama_openai(
     completion_id: str,
     api_model: str,
     ollama_model: str,
+    tools: Optional[List[dict]] = None,
 ):
 
     loop = asyncio.get_running_loop()
@@ -1517,6 +2201,22 @@ async def stream_ollama_openai(
     queue = asyncio.Queue()
 
     done_marker = object()
+
+    cancelled = threading.Event()
+
+    upstream_response = [None]
+    upstream_response_lock = threading.Lock()
+
+    def close_upstream_response():
+        with upstream_response_lock:
+            response = upstream_response[0]
+            upstream_response[0] = None
+
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
     payload = {
@@ -1553,6 +2253,13 @@ async def stream_ollama_openai(
     }
 
 
+    if tools:
+
+        payload[
+            "tools"
+        ] = tools
+
+
     data = json.dumps(
         payload,
         ensure_ascii=False,
@@ -1583,16 +2290,38 @@ async def stream_ollama_openai(
 
     def worker():
 
+        response = None
+
         try:
 
+            if cancelled.is_set():
+                return
+
             with ollama_lock:
+
+                if cancelled.is_set():
+                    return
 
                 with urllib.request.urlopen(
                     ollama_request,
                     timeout=600,
                 ) as response:
 
+                    with upstream_response_lock:
+                        upstream_response[0] = response
+
+                    if cancelled.is_set():
+                        return
+
                     for raw_line in response:
+
+                        # Abandon the generation as soon as the SSE
+                        # consumer is gone so the GPU lock is released
+                        # instead of being held for the full timeout.
+                        if cancelled.is_set():
+
+                            break
+
 
                         if not raw_line:
 
@@ -1634,6 +2363,22 @@ async def stream_ollama_openai(
                             )
 
 
+                        tool_calls = message.get(
+                            "tool_calls",
+                            [],
+                        )
+
+                        if tool_calls:
+
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                (
+                                    "tool_calls",
+                                    tool_calls,
+                                ),
+                            )
+
+
                         if obj.get(
                             "done",
                             False,
@@ -1652,6 +2397,9 @@ async def stream_ollama_openai(
 
         finally:
 
+            with upstream_response_lock:
+                upstream_response[0] = None
+
             loop.call_soon_threadsafe(
                 queue.put_nowait,
                 done_marker,
@@ -1668,60 +2416,296 @@ async def stream_ollama_openai(
     # SSE
     # --------------------------------------------------------
 
-    while True:
+    tool_ids_by_index = {}
 
-        if await request.is_disconnected():
+    tool_calls_by_index = {}
 
-            break
+    role_sent = False
+
+    saw_tool_calls = False
+
+    try:
+
+        while True:
+
+            if await request.is_disconnected():
+
+                break
 
 
-        item = await queue.get()
+            try:
+
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=STREAM_POLL_SECONDS,
+                )
+
+            except asyncio.TimeoutError:
+
+                continue
 
 
-        if item is done_marker:
+            if item is done_marker:
 
-            break
+                break
 
 
-        if isinstance(
-            item,
-            Exception,
-        ):
+            if isinstance(
+                item,
+                Exception,
+            ):
 
-            error_chunk = {
-                "error": {
-                    "message":
-                        str(item),
+                error_chunk = {
+                    "error": {
+                        "message":
+                            str(item),
 
-                    "type":
-                        "server_error",
+                        "type":
+                            "server_error",
+                    }
                 }
+
+
+                yield (
+                    "data: "
+                    + json.dumps(
+                        error_chunk,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+
+                yield (
+                    "data: [DONE]\n\n"
+                )
+
+                return
+
+
+            if (
+                isinstance(item, tuple)
+                and item[0] == "tool_calls"
+            ):
+
+                for position, tool_call in enumerate(
+                    item[1]
+                ):
+
+                    function = tool_call.get(
+                        "function",
+                        {},
+                    )
+
+                    index = tool_call.get(
+                        "index",
+                        function.get(
+                            "index",
+                            position,
+                        ),
+                    )
+
+                    current = tool_calls_by_index.get(
+                        index,
+                        {
+                            "index": index,
+
+                            "function": {
+                                "name": "",
+
+                                "arguments": {},
+                            },
+                        },
+                    )
+
+                    name = function.get(
+                        "name",
+                        "",
+                    )
+
+                    if name:
+
+                        current[
+                            "function"
+                        ][
+                            "name"
+                        ] = name
+
+                    incoming_arguments = function.get(
+                        "arguments",
+                        {},
+                    )
+
+                    existing_arguments = current[
+                        "function"
+                    ].get(
+                        "arguments",
+                        {},
+                    )
+
+                    if isinstance(
+                        existing_arguments,
+                        str,
+                    ) and isinstance(
+                        incoming_arguments,
+                        str,
+                    ):
+
+                        current[
+                            "function"
+                        ][
+                            "arguments"
+                        ] = (
+                            existing_arguments
+                            + incoming_arguments
+                        )
+
+                    elif isinstance(
+                        existing_arguments,
+                        dict,
+                    ) and isinstance(
+                        incoming_arguments,
+                        dict,
+                    ):
+
+                        current[
+                            "function"
+                        ][
+                            "arguments"
+                        ] = {
+                            **existing_arguments,
+                            **incoming_arguments,
+                        }
+
+                    elif isinstance(
+                        incoming_arguments,
+                        dict,
+                    ):
+
+                        if incoming_arguments:
+
+                            current[
+                                "function"
+                            ][
+                                "arguments"
+                            ] = incoming_arguments
+
+                    elif (
+                        incoming_arguments is not None
+                        and incoming_arguments != ""
+                    ):
+
+                        current[
+                            "function"
+                        ][
+                            "arguments"
+                        ] = incoming_arguments
+
+                    if tool_call.get(
+                        "id"
+                    ):
+
+                        current[
+                            "id"
+                        ] = tool_call[
+                            "id"
+                        ]
+
+                    tool_calls_by_index[
+                        index
+                    ] = current
+
+
+                continue
+
+
+            text = str(item)
+
+
+            if not text:
+
+                continue
+
+
+            delta = {
+                "content": text,
+            }
+
+            if not role_sent:
+
+                delta[
+                    "role"
+                ] = "assistant"
+
+                role_sent = True
+
+
+            chunk = {
+                "id":
+                    completion_id,
+
+                "object":
+                    "chat.completion.chunk",
+
+                "created":
+                    int(time.time()),
+
+                "model":
+                    api_model,
+
+                "choices": [
+                    {
+                        "index":
+                            0,
+
+                        "delta": delta,
+
+                        "finish_reason":
+                            None,
+                    }
+                ],
             }
 
 
             yield (
                 "data: "
                 + json.dumps(
-                    error_chunk,
+                    chunk,
                     ensure_ascii=False,
                 )
                 + "\n\n"
             )
 
+    finally:
 
-            yield (
-                "data: [DONE]\n\n"
+        cancelled.set()
+        close_upstream_response()
+
+
+    for tool_call in to_openai_tool_calls(
+        [
+            tool_calls_by_index[index]
+            for index in sorted(
+                tool_calls_by_index
             )
+        ],
+        tool_ids_by_index,
+        include_index=True,
+    ):
 
-            return
+        delta = {
+            "tool_calls": [
+                tool_call
+            ],
+        }
 
+        if not role_sent:
 
-        text = str(item)
+            delta[
+                "role"
+            ] = "assistant"
 
-
-        if not text:
-
-            continue
+            role_sent = True
 
 
         chunk = {
@@ -1739,20 +2723,15 @@ async def stream_ollama_openai(
 
             "choices": [
                 {
-                    "index":
-                        0,
+                    "index": 0,
 
-                    "delta": {
-                        "content":
-                            text,
-                    },
+                    "delta": delta,
 
                     "finish_reason":
                         None,
                 }
             ],
         }
-
 
         yield (
             "data: "
@@ -1762,6 +2741,8 @@ async def stream_ollama_openai(
             )
             + "\n\n"
         )
+
+        saw_tool_calls = True
 
 
     final_chunk = {
@@ -1775,7 +2756,7 @@ async def stream_ollama_openai(
             int(time.time()),
 
         "model":
-            "local-gpu-main",
+            api_model,
 
         "choices": [
             {
@@ -1786,7 +2767,11 @@ async def stream_ollama_openai(
                     {},
 
                 "finish_reason":
-                    "stop",
+                    (
+                        "tool_calls"
+                        if saw_tool_calls
+                        else "stop"
+                    ),
             }
         ],
     }
@@ -1833,13 +2818,66 @@ def root():
 
 
 # ============================================================
+# Whole-document OCR
+# ============================================================
+
+@app.post("/v1/ocr")
+async def ocr_document(
+    file: UploadFile = File(...),
+    language: str = "korean",
+    force_ocr: bool = False,
+):
+    data = await file.read(MAX_DOCUMENT_BYTES + 1)
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds {MAX_DOCUMENT_BYTES // (1024 * 1024)}MB",
+        )
+
+    # Bound concurrent OCR work. `async with` releases the slot on normal
+    # return and on cancellation, so a disconnecting client cannot wedge
+    # the endpoint the way a leaked lock would.
+    # ponytail: parse_document itself is not cancellable, so a cancelled
+    # request still finishes its worker thread; add a cooperative cancel
+    # token in ocr_engine if abandoned jobs ever become a real cost.
+    try:
+        async with ocr_semaphore:
+            parsed = await asyncio.to_thread(
+                parse_document,
+                data,
+                file.filename or "document",
+                language,
+                force_ocr,
+            )
+    except OCRInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OCRDependencyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        print("OCR error:", repr(exc))
+        raise HTTPException(status_code=500, detail="OCR processing failed") from exc
+
+    parsed["filename"] = file.filename or "document"
+    parsed["content_type"] = file.content_type or ""
+    return parsed
+
+
+# ============================================================
 # Health
 # ============================================================
 
 @app.get("/health")
 def health():
 
-    ollama_ready = check_ollama()
+    installed = ollama_tags()
+
+    ollama_ready = installed is not None
+
+    main_model_installed = (
+        OLLAMA_MODEL_MAIN in installed
+        if installed is not None
+        else False
+    )
 
 
     return {
@@ -1855,22 +2893,36 @@ def health():
 
         "npu": {
             "status":
-                "ready",
+                "ready"
+                if npu_fast is not None
+                else "unavailable",
 
             "device":
                 "Intel AI Boost",
 
             "model":
-                "LFM2-1.2B",
+                "LFM2-1.2B"
+                if npu_fast is not None
+                else "unavailable",
+
+            "error":
+                NPU_FAST_ERROR,
         },
 
         "gpu": {
+            # "ready" means the daemon answered and the main model is
+            # installed; it does not claim the model is loaded on device.
             "status":
                 (
                     "ready"
+                    if main_model_installed
+                    else "degraded"
                     if ollama_ready
                     else "unavailable"
                 ),
+
+            "main_model_installed":
+                main_model_installed,
 
             "device":
                 "Intel Arc 140V",
@@ -1883,6 +2935,26 @@ def health():
 
             "deep_model":
                 OLLAMA_MODEL_DEEP,
+
+            "vision_model":
+                OLLAMA_MODEL_VISION,
+        },
+
+        # Dependencies are probed at import time; the OCR models are
+        # loaded lazily, so "ready" here means "dependencies present",
+        # not "a model is warm".
+        "ocr": {
+            "status":
+                (
+                    "ready"
+                    if OCR_DEPENDENCIES_PRESENT
+                    else "unavailable"
+                ),
+            "engine": "RapidOCR",
+            "backend": "OpenVINO",
+            "model": "PP-OCRv5",
+            "language": "korean",
+            "models_loaded_lazily": True,
         },
     }
 
@@ -1893,57 +2965,40 @@ def health():
 
 @app.get("/v1/models")
 def models():
-
-    return {
-        "object":
-            "list",
-
-        "data": [
+    data = []
+    if npu_fast is not None:
+        data.append(
             {
-                "id":
-                    "local-npu-fast",
-
-                "object":
-                    "model",
-
-                "owned_by":
-                    "openvino-npu",
-            },
-
+                "id": "local-npu-fast",
+                "object": "model",
+                "owned_by": "openvino-npu",
+            }
+        )
+    data.extend(
+        [
             {
-                "id":
-                    "local-gpu-main",
-
-                "object":
-                    "model",
-
-                "owned_by":
-                    "ollama-vulkan",
+                "id": "local-gpu-main",
+                "object": "model",
+                "owned_by": "ollama-vulkan",
             },
-
             {
-                "id":
-                    "local-gpu-deep",
-
-                "object":
-                    "model",
-
-                "owned_by":
-                    "ollama-vulkan",
+                "id": "local-gpu-deep",
+                "object": "model",
+                "owned_by": "ollama-vulkan",
             },
-
             {
-                "id":
-                    "local-auto",
-
-                "object":
-                    "model",
-
-                "owned_by":
-                    "local-router",
+                "id": "local-vision",
+                "object": "model",
+                "owned_by": "ollama-vulkan-vision",
             },
-        ],
-    }
+            {
+                "id": "local-auto",
+                "object": "model",
+                "owned_by": "local-router",
+            },
+        ]
+    )
+    return {"object": "list", "data": data}
 
 
 # ============================================================
@@ -1991,6 +3046,25 @@ async def chat_completions(
         )
 
 
+    try:
+
+        validate_request_images(
+            request.messages
+        )
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+
+    has_images = request_has_images(
+        request.messages
+    )
+
+
     model = request.model
 
 
@@ -2005,7 +3079,7 @@ async def chat_completions(
         )
 
 
-        if not last_user:
+        if not last_user and not has_images:
 
             raise HTTPException(
                 status_code=400,
@@ -2016,9 +3090,69 @@ async def chat_completions(
             )
 
 
-        model = choose_model(
-            last_user
+        model = (
+            "local-vision"
+            if has_images
+            else choose_model(last_user)
         )
+
+
+    if has_images and model != "local-vision":
+
+        if request.model == "local-auto":
+
+            model = "local-vision"
+
+        else:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Image input requires local-vision or local-auto"
+                ),
+            )
+
+
+    if model == "local-npu-fast" and npu_fast is None:
+
+        if request.model == "local-auto":
+
+            model = "local-gpu-main"
+
+        else:
+
+            raise HTTPException(
+                status_code=503,
+                detail="NPU backend is unavailable; use local-gpu-main",
+            )
+
+
+    if request.tools and model == "local-vision":
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "local-vision does not support tools"
+            ),
+        )
+
+
+    if request.tools and model == "local-npu-fast":
+
+        if request.model == "local-auto":
+
+            model = "local-gpu-main"
+
+
+        else:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tools are supported only on GPU models "
+                    "or local-auto"
+                ),
+            )
 
 
     if model == "local-npu-fast":
@@ -2053,6 +3187,7 @@ async def chat_completions(
         "local-npu-fast",
         "local-gpu-main",
         "local-gpu-deep",
+        "local-vision",
     }
 
 
@@ -2077,6 +3212,19 @@ async def chat_completions(
         request.messages
     )
 
+    external_web_tools = any(
+        tool.get(
+            "function",
+            {},
+        ).get(
+            "name"
+        ) in {
+            "search_web",
+            "fetch_url",
+        }
+        for tool in request.tools or []
+    )
+
     last_user = get_last_user_message(
         request.messages
     )
@@ -2094,10 +3242,14 @@ async def chat_completions(
     live_game = ""
 
 
-    if model in {
-        "local-gpu-main",
-        "local-gpu-deep",
-    } and not is_live_info_query(last_user):
+    if (
+        model in {
+            "local-gpu-main",
+            "local-gpu-deep",
+            "local-vision",
+        }
+        and not is_live_info_query(last_user)
+    ):
 
         (
             effective_messages,
@@ -2116,8 +3268,10 @@ async def chat_completions(
         model in {
             "local-gpu-main",
             "local-gpu-deep",
+            "local-vision",
         }
         and is_live_info_query(last_user)
+        and not external_web_tools
     ):
 
         live_data = await asyncio.to_thread(
@@ -2271,6 +3425,9 @@ async def chat_completions(
 
                     ollama_model=
                         ollama_model,
+
+                    tools=
+                        request.tools,
                 )
             )
 
@@ -2302,6 +3459,8 @@ async def chat_completions(
 
     ollama_metrics = {}
 
+    ollama_tool_calls = []
+
 
     try:
 
@@ -2328,6 +3487,7 @@ async def chat_completions(
             (
                 output,
                 ollama_metrics,
+                ollama_tool_calls,
             ) = await asyncio.to_thread(
                 run_ollama_gpu,
 
@@ -2338,6 +3498,8 @@ async def chat_completions(
                 temperature,
 
                 ollama_model,
+
+                request.tools,
             )
 
 
@@ -2366,6 +3528,23 @@ async def chat_completions(
         - start
     )
 
+    # Measured NPU token counts, or None. Never a fabricated zero.
+    if device == "NPU":
+
+        npu_usage_prompt_tokens = npu_text_token_count(
+            messages_to_npu_prompt(request.messages)
+        )
+
+        npu_usage_completion_tokens = npu_text_token_count(
+            output
+        )
+
+    else:
+
+        npu_usage_prompt_tokens = None
+
+        npu_usage_completion_tokens = None
+
     if (
         rag_enabled
         and device == "GPU"
@@ -2376,7 +3555,30 @@ async def chat_completions(
 
     finish_reason = "stop"
 
+    openai_tool_calls = to_openai_tool_calls(
+        ollama_tool_calls
+    )
+
+    if openai_tool_calls:
+
+        finish_reason = "tool_calls"
+
+
+    assistant_message = {
+        "role": "assistant",
+
+        "content": output,
+    }
+
+    if openai_tool_calls:
+
+        assistant_message[
+            "tool_calls"
+        ] = openai_tool_calls
+
     if (
+        not openai_tool_calls
+        and
         device == "GPU"
         and ollama_metrics.get(
             "done_reason"
@@ -2403,57 +3605,30 @@ async def chat_completions(
                 "index":
                     0,
 
-                "message": {
-                    "role":
-                        "assistant",
-
-                    "content":
-                        output,
-                },
+                "message": assistant_message,
 
                 "finish_reason":
                     finish_reason,
             }
         ],
 
-        "usage": {
-            "prompt_tokens":
-                (
-                    ollama_metrics.get(
-                        "prompt_tokens"
-                    )
-                    if device == "GPU"
-                    else 0
-                ),
+        "usage": _usage_block(
+            (
+                ollama_metrics.get(
+                    "prompt_tokens"
+                )
+                if device == "GPU"
+                else npu_usage_prompt_tokens
+            ),
 
-            "completion_tokens":
-                (
-                    ollama_metrics.get(
-                        "completion_tokens"
-                    )
-                    if device == "GPU"
-                    else 0
-                ),
-
-            "total_tokens":
-                (
-                    (
-                        ollama_metrics.get(
-                            "prompt_tokens"
-                        )
-                        or 0
-                    )
-                    +
-                    (
-                        ollama_metrics.get(
-                            "completion_tokens"
-                        )
-                        or 0
-                    )
-                    if device == "GPU"
-                    else 0
-                ),
-        },
+            (
+                ollama_metrics.get(
+                    "completion_tokens"
+                )
+                if device == "GPU"
+                else npu_usage_completion_tokens
+            ),
+        ),
 
         "local_metrics": {
             "device":
@@ -2527,7 +3702,7 @@ async def chat_completions(
                         "prompt_tokens"
                     )
                     if device == "GPU"
-                    else None
+                    else npu_usage_prompt_tokens
                 ),
 
             "prompt_eval_seconds":
@@ -2570,7 +3745,7 @@ async def chat_completions(
                         "completion_tokens"
                     )
                     if device == "GPU"
-                    else None
+                    else npu_usage_completion_tokens
                 ),
 
             "eval_seconds":

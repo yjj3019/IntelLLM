@@ -9,10 +9,15 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
+os.environ["NO_PROXY"] = ",".join(dict.fromkeys(
+    [part.strip() for part in os.getenv("NO_PROXY", "").split(",") if part.strip()]
+    + ["192.168.1.3", "127.0.0.1", "localhost"]
+))
+
 
 SEARXNG_URL = os.environ.get(
     "LOCAL_SEARCH_URL",
-    "http://127.0.0.1:8888",
+    "http://192.168.1.3:8888",
 ).rstrip("/")
 
 SEARCH_TIMEOUT = 8
